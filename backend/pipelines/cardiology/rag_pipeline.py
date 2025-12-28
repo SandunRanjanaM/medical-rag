@@ -1,64 +1,84 @@
-# backend/pipelines/cardiology/rag_pipeline.py
-import json
-import faiss
 import numpy as np
-import torch
+from typing import List
+from haystack import Pipeline, Document, component
+from haystack.components.builders import PromptBuilder
+from haystack.components.generators import HuggingFaceLocalGenerator
+from haystack.components.embedders import SentenceTransformersDocumentEmbedder
+from .models import l2_normalize
 
-from .models import (
-    instructor, inbedder, proj,
-    hyde_model, hyde_tokenizer,
-    final_model, final_tokenizer, device
-)
+# --------------------
+# HyDE Components
+# --------------------
+@component
+class HypothesisConverter:
+    def __init__(self, instruction: str):
+        self.instruction = instruction
 
-INDEX_PATH = "vectorstores/cardiology.faiss"
-META_PATH = "vectorstores/cardiology_meta.json"
+    @component.output_types(documents=List[Document])
+    def run(self, replies: List[str]):
+        return {
+            "documents": [
+                Document(content=f"{self.instruction}\n{reply}")
+                for reply in replies
+            ]
+        }
 
-index = faiss.read_index(INDEX_PATH)
-with open(META_PATH) as f:
-    kb_text = json.load(f)
+@component
+class HypotheticalDocumentEmbedder:
+    def __init__(
+        self,
+        instruct_llm="SandunR/hyde-sciFive-cardiology-generator",
+        embedder_model="hkunlp/instructor-large",
+        nr_completions=4,
+    ):
+        self.INSTRUCTION = "Represent the cardiology document for retrieval:"
 
-def generate_hyde(query):
-    inputs = hyde_tokenizer(
-        f"hypothetical answer: {query}",
-        return_tensors="pt",
-        truncation=True,
-        max_length=128
-    ).to(device)
+        self.generator = HuggingFaceLocalGenerator(
+            model=instruct_llm,
+            task="text2text-generation",
+            generation_kwargs={
+                "do_sample": True,
+                "num_beams": 4,
+                "num_return_sequences": nr_completions,
+                "temperature": 0.7,
+                "max_new_tokens": 300,
+            },
+        )
 
-    outputs = hyde_model.generate(**inputs, max_length=180)
-    return hyde_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        self.prompt_builder = PromptBuilder(
+            template="Question: {{question}}\nParagraph:",
+            required_variables=["question"],
+        )
 
-def cardiology_qa(query, alpha=0.5, top_k=5):
-    # HyDE embedding
-    hyde_doc = generate_hyde(query)
-    hyde_emb = instructor.encode([hyde_doc])[0]
-    hyde_emb = proj(torch.tensor(hyde_emb).float().unsqueeze(0).to(device))
-    hyde_emb = hyde_emb.squeeze(0).detach().cpu().numpy()
-    hyde_emb /= np.linalg.norm(hyde_emb)
+        self.converter = HypothesisConverter(self.INSTRUCTION)
 
-    # Query embedding
-    q_emb = inbedder.encode([query], "medical query: ")[0]
-    q_emb /= np.linalg.norm(q_emb)
+        self.embedder = SentenceTransformersDocumentEmbedder(
+            model=embedder_model,
+            progress_bar=False,
+        )
+        self.embedder.warm_up()
 
-    # Combine
-    final_emb = alpha * q_emb + (1 - alpha) * hyde_emb
-    final_emb /= np.linalg.norm(final_emb)
+        self.pipeline = Pipeline()
+        self.pipeline.add_component("prompt", self.prompt_builder)
+        self.pipeline.add_component("generator", self.generator)
+        self.pipeline.add_component("converter", self.converter)
+        self.pipeline.add_component("embedder", self.embedder)
 
-    # Retrieve
-    _, I = index.search(final_emb.reshape(1, -1).astype("float32"), top_k)
-    retrieved = [kb_text[i] for i in I[0]]
+        self.pipeline.connect("prompt", "generator")
+        self.pipeline.connect("generator.replies", "converter.replies")
+        self.pipeline.connect("converter.documents", "embedder.documents")
 
-    # Generate answer
-    context = "\n".join([r["answer"] for r in retrieved])
-    prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
+    @component.output_types(hypothetical_embedding=List[float])
+    def run(self, query: str):
+        result = self.pipeline.run({"prompt": {"question": query}})
+        docs = result["embedder"]["documents"]
+        stacked = np.array([doc.embedding for doc in docs])
+        avg = stacked.mean(axis=0)
+        return {"hypothetical_embedding": l2_normalize(avg).tolist()}
 
-    inputs = final_tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
-    outputs = final_model.generate(**inputs, max_length=256)
-
-    answer = final_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    return {
-        "answer": answer,
-        "hyde": hyde_doc,
-        "sources": retrieved
-    }
+# --------------------
+# Fusion
+# --------------------
+def fuse_embeddings(proj_query, hyde_query, alpha=0.5):
+    fused = alpha * proj_query + (1 - alpha) * hyde_query
+    return l2_normalize(fused)

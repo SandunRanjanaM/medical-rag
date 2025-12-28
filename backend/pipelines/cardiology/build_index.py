@@ -1,59 +1,53 @@
-# backend/pipelines/cardiology/build_index.py
-# Builds FAISS index using ONLY first 100 rows (for development)
-
 import json
-import numpy as np
+import os
 import faiss
-import torch
-import torch.nn as nn
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
+import numpy as np
+from haystack import Document, Pipeline
+from haystack.components.preprocessors import DocumentCleaner, DocumentSplitter
+from haystack.components.embedders import SentenceTransformersDocumentEmbedder
+from haystack.components.writers import DocumentWriter
+from haystack.document_stores.in_memory import InMemoryDocumentStore
 
-DATA_PATH = "data/cardiology/raw/miriad_cardiology.json"
-INDEX_PATH = "vectorstores/cardiology.faiss"
-META_PATH = "vectorstores/cardiology_meta.json"
-MAX_ROWS = 100  # <<< LIMIT HERE
+from pathlib import Path
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# project root = medical-rag/
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-# Models
-instructor = SentenceTransformer("hkunlp/instructor-large").to(device)
-proj = nn.Linear(768, 1024).to(device)
+DATA_PATH = PROJECT_ROOT / "data/cardiology/raw/miriad_cardiology.json"
+INDEX_PATH = PROJECT_ROOT / "backend/vectorstores/cardiology.faiss"
+META_PATH = PROJECT_ROOT / "backend/vectorstores/cardiology_meta.json"
 
-def build_index():
-    with open(DATA_PATH, "r") as f:
-        data = json.load(f)
+def build_index(limit=100):
+    with open(DATA_PATH) as f:
+        raw_data = json.load(f)[:limit]
 
-    # LIMIT TO FIRST 100 ROWS
-    data = data[:MAX_ROWS]
+    documents = []
+    INSTRUCTION = "Represent the cardiology answer for retrieval:"
 
-    embeddings = []
-    metadata = []
+    for row in raw_data:
+        if isinstance(row.get("answer"), str):
+            documents.append(
+                Document(
+                    content=f"{INSTRUCTION}\n{row['answer']}",
+                    meta=row
+                )
+            )
 
-    for row in tqdm(data, desc="Building embeddings"):
-        text = row["question"] + " " + row["answer"]
+    document_store = InMemoryDocumentStore()
 
-        emb_768 = instructor.encode([text])[0]
-        emb_1024 = proj(
-            torch.tensor(emb_768).float().unsqueeze(0).to(device)
-        ).squeeze(0).detach().cpu().numpy()
+    indexing = Pipeline()
+    indexing.add_component("cleaner", DocumentCleaner())
+    indexing.add_component("splitter", DocumentSplitter(split_by="sentence", split_length=8))
+    indexing.add_component(
+        "embedder",
+        SentenceTransformersDocumentEmbedder(model="hkunlp/instructor-large")
+    )
+    indexing.add_component("writer", DocumentWriter(document_store))
 
-        emb_1024 /= np.linalg.norm(emb_1024)
+    indexing.connect("cleaner", "splitter")
+    indexing.connect("splitter", "embedder")
+    indexing.connect("embedder", "writer")
 
-        embeddings.append(emb_1024)
-        metadata.append(row)
+    indexing.run({"cleaner": {"documents": documents}})
 
-    embeddings = np.array(embeddings, dtype="float32")
-
-    index = faiss.IndexFlatL2(1024)
-    index.add(embeddings)
-
-    faiss.write_index(index, INDEX_PATH)
-
-    with open(META_PATH, "w") as f:
-        json.dump(metadata, f)
-
-    print(f"FAISS index built with {index.ntotal} documents")
-
-if __name__ == "__main__":
-    build_index()
+    return document_store

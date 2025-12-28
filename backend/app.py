@@ -1,11 +1,9 @@
+
 from fastapi import FastAPI
-from router import route_question
+from router import router
 
 app = FastAPI()
 
-@app.post("/ask")
-def ask(payload: dict):
-    return route_question(
-        payload["specialty"],
-        payload["question"]
-    )
+
+# Include the router from router.py
+app.include_router(router)
